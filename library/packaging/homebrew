@@ -21,115 +21,308 @@ DOCUMENTATION = '''
 ---
 module: homebrew
 author: Andrew Dunham
-short_description: Package manager for Homebrew
+short_description: Formula manager for Homebrew
 description:
-    - Manages Homebrew packages
+    - Manages Homebrew formulae
 version_added: "1.4"
 options:
     name:
         description:
-            - name of package to install/remove
-        required: true
+            - name of formula to install/remove
+        required: false
+        default: null
     state:
         description:
-            - state of the package
-        choices: [ 'present', 'absent' ]
+            - state of the formula
+        choices: [ "latest", "present", "absent" ]
         required: false
         default: present
     update_homebrew:
         description:
             - update homebrew itself first
         required: false
-        default: "no"
+        default: no
         choices: [ "yes", "no" ]
+    cache_valid_time:
+        description:
+            - If C(update_homebrew) is specified and the last run is less or equal than I(cache_valid_time) seconds ago, the C(update_homebrew) gets skipped.
+        required: false
+        default: no
     install_options:
         description:
-            - options flags to install a package
+            - options flags to install a formula
         required: false
         default: null
 notes:  []
 '''
 EXAMPLES = '''
+- homebrew: update_homebrew=yes
+- homebrew: update_homebrew=yes cache_valid_time=3600
 - homebrew: name=foo state=present
+- homebrew: name=foo state=latest
 - homebrew: name=foo state=present update_homebrew=yes
 - homebrew: name=foo state=absent
 - homebrew: name=foo,bar state=absent
 - homebrew: name=foo state=present install_options=with-baz,enable-debug
 '''
 
+import os
+import datetime
 
-def update_homebrew(module, brew_path):
-    """ Updates packages list. """
+class Result:
 
-    rc, out, err = module.run_command("%s update" % brew_path)
+    def __init__(self, rc, out, err, changed=True):
+        self.rc = rc
+        self.out = out
+        self.err = err
+        self.changed = changed
 
-    if rc != 0:
-        module.fail_json(msg="could not update homebrew")
+    def was_successful(self):
+        return self.rc == 0
+
+    def was_changed(self):
+        return self.changed;
+
+    def rc(self):
+        return self.rc
+
+    def out(self):
+        return self.out
+
+    def err(self):
+        return self.err
 
 
-def query_package(module, brew_path, name, state="present"):
-    """ Returns whether a package is installed or not. """
+class HomebrewFormula:
 
-    if state == "present":
-        rc, out, err = module.run_command("%s list %s" % (brew_path, name))
+    def __init__(self, json, homebrew):
+        self.json = json
+        self.homebrew = homebrew
+
+    def name(self):
+        return self.json['name']
+
+    def as_json(self):
+        return self.json
+
+    def is_installed(self):
+        return len(self.json['installed']) > 0
+
+    def is_installed_latest(self):
+        return (self.installed_version() == self.latest_version())
+
+    def installed_version(self):
+        if self.is_installed():
+            return self.json['installed'][-1]['version']
+        else:
+            return False
+
+    def latest_version(self):
+        version = self.json['versions']['stable']
+        if self.latest_revision():
+          version = "%s_%s" % (version, self.latest_revision())
+
+        return version
+
+    def latest_revision(self):
+      return self.json['versions']['revision']
+
+    def remove(self):
+        return self.homebrew.remove_formula(self)
+
+    def install(self, options):
+        return self.homebrew.install_formula(self, options)
+
+    def upgrade(self, options):
+        return self.homebrew.upgrade_formula(self, options)
+
+
+class Homebrew:
+    ''' Homebrew class to manage info, search, update, install, upgrade and remove '''
+
+    def __init__(self, module, brew_path):
+        self.module = module
+        self.brew_path = brew_path
+
+    def info_for_formula(self, formula):
+      cmd = "%s info --json=v1 %s" % (self.brew_path, formula)
+      rc, out, err = self.module.run_command(cmd)
+
+      if rc == 0:
+          info = json.loads(out)
+          return HomebrewFormula(info, self)
+      else:
+          return False
+
+    def outdated_formulae(self):
+        formulae = []
+        rc, out, err = self.module.run_command("%s outdated" % self.brew_path)
+
         if rc == 0:
-            return True
+            outdated_formulae = out.strip().splitlines()
+            if len(outdated_formulae) > 0:
+              for f in outdated_formulae:
+                formula = self.info_for_formula(f)
+                formulae.append(formula)
 
-        return False
+        return formulae
+
+    def install_formula(self, formula, options=False):
+        cmd = "%s install %s" % (self.brew_path, formula)
+        if options:
+          cmd = "%s %s" % (cmd, options)
+        rc, out, err = self.module.run_command(cmd)
+
+        return Result(rc, out, err)
+
+    def upgrade_formula(self, formula, options=False):
+        cmd = "%s upgrade %s" % (self.brew_path, formula.name())
+        if options:
+          cmd = "%s %s" % (cmd, options)
+        rc, out, err = self.module.run_command(cmd)
+
+        return Result(rc, out, err)
+
+    def remove_formula(self, formula):
+        rc, out, err = self.module.run_command("%s remove %s" % (self.brew_path, formula))
+        return Result(rc, out, err)
+
+    def last_updated_timestamp(self):
+        try:
+            return os.stat(self.head_file()).st_mtime
+        except Exception, e:
+            return False
+
+    def update(self, cache_valid_time=False):
+        if cache_valid_time and self.__last_updated_within_cache_valid_time(cache_valid_time):
+            rc, out, err, changed = [ 0, 'No update required', '', False ]
+        else:
+            changed = True
+            rc, out, err = self.module.run_command("%s update" % self.brew_path)
+
+        return Result(rc, out, err, changed)
+
+    def head_file(self):
+        return "%s/.git/HEAD" % self.__brew_prefix()
+
+    def __brew_prefix(self):
+        rc, out, err = self.module.run_command("%s --prefix" % self.brew_path)
+        return out.strip()
+
+    def __timestamp_now(self):
+        return datetime.datetime.now()
+
+    def __last_updated_within_cache_valid_time(self, cache_valid_time):
+        tdelta = datetime.timedelta(seconds=cache_valid_time)
+        mtimestamp = datetime.datetime.fromtimestamp(self.last_updated_timestamp())
+
+        return mtimestamp + tdelta >= self.__timestamp_now()
 
 
-def remove_packages(module, brew_path, packages):
-    """ Uninstalls one or more packages if installed. """
+def update_homebrew(module, homebrew, cache_valid_time):
+    """ Updates formulae list. """
 
+    result = homebrew.update(cache_valid_time)
+
+    if result.was_successful():
+        module.exit_json(changed=result.was_changed())
+    else:
+        module.fail_json(msg="unable to update %s" % result.err)
+
+
+def remove_formulae(module, homebrew, formulae):
+    """ Uninstalls one or more formulae if installed. """
+
+    changed = False
     removed_count = 0
 
-    # Using a for loop incase of error, we can report the package that failed
-    for package in packages:
-        # Query the package first, to see if we even need to remove.
-        if not query_package(module, brew_path, package):
-            continue
+    for formula in formulae:
+        if formula:
+          if module.check_mode:
+              module.exit_json(changed=True)
 
-        if module.check_mode:
-            module.exit_json(changed=True)
-        rc, out, err = module.run_command([brew_path, 'remove', package])
+          if formula.is_installed():
+            result = formula.remove()
 
-        if query_package(module, brew_path, package):
-            module.fail_json(msg="failed to remove %s: %s" % (package, out.strip()))
-
-        removed_count += 1
+            if result.was_successful():
+                removed_count += 1
+            else:
+                module.fail_json(msg="failed to remove %s: %s" % (formula, result.err.strip()))
 
     if removed_count > 0:
-        module.exit_json(changed=True, msg="removed %d package(s)" % removed_count)
+      changed = True
 
-    module.exit_json(changed=False, msg="package(s) already absent")
+    module.exit_json(changed=changed, msg="removed %d formulae" % removed_count)
 
 
-def install_packages(module, brew_path, packages, options):
-    """ Installs one or more packages if not already installed. """
+def upgrade_all_formulae(module, homebrew, options):
+    """ Upgrades all outdated formulae. """
+
+    formulae = homebrew.outdated_formulae()
+
+    if len(formulae) > 0:
+        upgrade_formulae(module, homebrew, formulae, options)
+    else:
+        module.exit_json(changed=False, msg="no formulae to upgrade")
+
+
+def upgrade_formulae(module, homebrew, formulae, options):
+    """ Upgrades (or installs) formulae. """
+
+    counts = { 'install': 0, 'upgrade': 0 }
+
+    for formula in formulae:
+        if formula:
+          if formula.is_installed():
+              if not formula.is_installed_latest():
+                  mode = 'upgrade'
+              else:
+                continue
+          else:
+              mode = 'install'
+
+          if module.check_mode:
+              module.exit_json(changed=True)
+
+          if mode == 'install':
+              result = formula.install(options)
+          else:
+              result = formula.upgrade(options)
+
+          if result.was_successful():
+              counts[mode] += 1
+          else:
+              module.fail_json(msg="failed to %s %s: %s, %s" % (mode, formula.name(), result.out.strip(), result.err.strip()))
+
+    if counts['install'] > 0 or counts['upgrade'] > 0:
+        module.exit_json(changed=True, msg="installed %d, upgraded %d formulae" % (counts['install'], counts['upgrade']))
+    else:
+        module.exit_json(changed=False)
+
+
+def install_formulae(module, homebrew, formulae, options):
+    """ Installs one or more formulae if not already installed. """
 
     installed_count = 0
 
-    for package in packages:
-        if query_package(module, brew_path, package):
-            continue
+    for formula in formulae:
+        if formula:
+          if not formula.is_installed():
+              if module.check_mode:
+                  module.exit_json(changed=True)
 
-        if module.check_mode:
-            module.exit_json(changed=True)
+              result = formula.install(options)
 
-        cmd = [brew_path, 'install', package]
-        if options:
-            cmd.extend(options)
-        rc, out, err = module.run_command(cmd)
-
-        if not query_package(module, brew_path, package):
-            module.fail_json(msg="failed to install %s: '%s' %s" % (package, cmd, out.strip()))
-
-        installed_count += 1
+              if result.was_successful():
+                  installed_count += 1
+              else:
+                  module.fail_json(msg="failed to install %s: %s" % (formula.name(), result.out.strip()))
 
     if installed_count > 0:
-        module.exit_json(changed=True, msg="installed %d package(s)" % (installed_count,))
+        module.exit_json(changed=True, msg="installed %d formulae" % (installed_count,))
 
-    module.exit_json(changed=False, msg="package(s) already present")
+    module.exit_json(changed=False, msg="all formulae already present")
+
 
 def generate_options_string(install_options):
     if install_options is None:
@@ -146,29 +339,44 @@ def generate_options_string(install_options):
 def main():
     module = AnsibleModule(
         argument_spec = dict(
-            name = dict(aliases=["pkg"], required=True),
-            state = dict(default="present", choices=["present", "installed", "absent", "removed"]),
+            name = dict(aliases=["pkg"]),
+            state = dict(default="present", choices=["present", "installed", "latest", "absent", "removed"]),
+            upgrade = dict(default="no", type='bool'),
             update_homebrew = dict(default="no", aliases=["update-brew"], type='bool'),
+            cache_valid_time = dict(type='int'),
             install_options = dict(default=None, aliases=["options"], type='list')
         ),
         supports_check_mode=True
     )
 
     brew_path = module.get_bin_path('brew', True, ['/usr/local/bin'])
+    homebrew = Homebrew(module, brew_path)
 
     p = module.params
 
     if p["update_homebrew"]:
-        update_homebrew(module, brew_path)
+        update_homebrew(module, homebrew, p["cache_valid_time"])
 
-    pkgs = p["name"].split(",")
-
-    if p["state"] in ["present", "installed"]:
+    if p['upgrade']:
         opt = generate_options_string(p["install_options"])
-        install_packages(module, brew_path, pkgs, opt)
+        upgrade_all_formulae(module, homebrew, opt)
 
-    elif p["state"] in ["absent", "removed"]:
-        remove_packages(module, brew_path, pkgs)
+    if p["name"]:
+        formulae = []
+
+        for f in p["name"].split(","):
+            formulae.append(homebrew.info_for_formula(f))
+
+        if p["state"] in ["present", "installed"]:
+            opt = generate_options_string(p["install_options"])
+            install_formulae(module, homebrew, formulae, opt)
+
+        elif p["state"] in ["latest"]:
+            opt = generate_options_string(p["install_options"])
+            upgrade_formulae(module, homebrew, formulae, opt)
+
+        elif p["state"] in ["absent", "removed"]:
+            remove_formulae(module, homebrew, formulae)
 
 # import module snippets
 from ansible.module_utils.basic import *
